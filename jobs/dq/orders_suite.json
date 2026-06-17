@@ -1,0 +1,39 @@
+{
+  "expectation_suite_name": "orders_suite",
+  "expectations": [
+    {
+      "expectation_type": "expect_column_values_to_not_be_null",
+      "kwargs": { "column": "order_id" },
+      "meta": { "rule_id": "R-COMPL-002", "dimension": "completeness", "severity": "critical" }
+    },
+    {
+      "expectation_type": "expect_column_values_to_not_be_null",
+      "kwargs": { "column": "customer_id", "mostly": 0.99 },
+      "meta": { "rule_id": "R-COMPL-001", "dimension": "completeness", "severity": "warn" }
+    },
+    {
+      "expectation_type": "expect_column_values_to_be_unique",
+      "kwargs": { "column": "order_id" },
+      "meta": { "rule_id": "R-UNIQ-001", "dimension": "uniqueness", "severity": "critical" }
+    },
+    {
+      "expectation_type": "expect_column_values_to_match_regex",
+      "kwargs": {
+        "column": "email",
+        "regex": "^[A-Za-z0-9._%+\\-]+@[A-Za-z0-9.\\-]+\\.[A-Za-z]{2,}$",
+        "mostly": 0.99
+      },
+      "meta": { "rule_id": "R-VALID-001", "dimension": "validity", "severity": "warn" }
+    },
+    {
+      "expectation_type": "expect_column_values_to_be_between",
+      "kwargs": { "column": "quantity", "min_value": 1, "max_value": 1000 },
+      "meta": { "rule_id": "R-VALID-002", "dimension": "validity", "severity": "warn" }
+    },
+    {
+      "expectation_type": "expect_table_row_count_to_be_between",
+      "kwargs": { "min_value": 1 },
+      "meta": { "rule_id": "R-VOL-001", "dimension": "volume", "severity": "critical" }
+    }
+  ]
+}

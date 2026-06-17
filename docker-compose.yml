@@ -244,6 +244,45 @@ services:
       - grafana-data:/var/lib/grafana
     networks:
       - observability-net
+  
+  postgres:
+    image: postgres:16
+    container_name: postgres
+    hostname: postgres
+    environment:
+      POSTGRES_USER: dq
+      POSTGRES_PASSWORD: dq
+      POSTGRES_DB: dq
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U dq -d dq"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    networks:
+      - observability-net
+
+  agent:
+      build: ./agent
+      container_name: agent
+      depends_on:
+        kafka:
+          condition: service_healthy
+        postgres:
+          condition: service_healthy
+      environment:
+        # ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}
+        GROQ_API_KEY: ${GROQ_API_KEY} 
+        KAFKA_BOOTSTRAP: kafka:9092
+        POSTGRES_DSN: postgresql://dq:dq@postgres:5432/dq
+        SLACK_WEBHOOK_URL: ${SLACK_WEBHOOK_URL:-}
+        # MODEL_NAME: claude-sonnet-4-6
+        MODEL_NAME: llama-3.3-70b-versatile
+      networks:
+        - observability-net
 
 volumes:
   kafka-data:
@@ -251,8 +290,11 @@ volumes:
   spark-checkpoints:
   prometheus-data:
   grafana-data:
+  postgres-data:  
 
 networks:
   observability-net:
     driver: bridge
     name: observability-net
+
+

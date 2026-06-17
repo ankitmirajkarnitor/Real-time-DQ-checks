@@ -1,18 +1,13 @@
 """
-dq_stream_job.py — Phase 2 (v2): full DQ pipeline.
+dq_stream_job.py — Phase A: Great Expectations engine.
 
-Flow per micro-batch (every 30 seconds):
+Flow per micro-batch:
   orders_raw  ──►  parse JSON
-              ──►  record-level validation (PySpark):
-                       GOOD records  ──►  orders_clean
-                       BAD  records  ──►  orders_quarantine (with reason)
-              ──►  batch-level DQ (Soda Core):
-                       summary metrics  ──►  observability_events
-
-Key fix vs v1:
-  - Uses batch_df.sparkSession (the session the DataFrame is bound to)
-    instead of the captured outer `spark`. This resolves the
-    TABLE_OR_VIEW_NOT_FOUND error for `orders_batch`.
+              ──►  record-level routing (PySpark):
+                       GOOD  ──►  orders_clean
+                       BAD   ──►  orders_quarantine
+              ──►  batch-level DQ (Great Expectations):
+                       results ──►  observability_events
 """
 from __future__ import annotations
 
@@ -26,6 +21,8 @@ from pyspark.sql.types import (
     StructType, StructField, StringType, IntegerType, DoubleType
 )
 
+import great_expectations as gx
+
 # ---------------------------------------------------------------------------
 KAFKA_BOOTSTRAP   = "kafka:9092"
 SOURCE_TOPIC      = "orders_raw"
@@ -34,34 +31,7 @@ QUARANTINE_TOPIC  = "orders_quarantine"
 OBS_TOPIC         = "observability_events"
 TRIGGER_SEC       = 30
 CHECKPOINT_BASE   = "/opt/checkpoints/dq_stream_job"
-
-# Top of file
-RULE_SEVERITY = {
-    "R-COMPL-001": "WARN",
-    "R-COMPL-002": "CRITICAL",
-    "R-UNIQ-001":  "CRITICAL",
-    "R-VALID-001": "WARN",
-    "R-VALID-002": "WARN",
-    "R-VOL-001":   "CRITICAL",
-}
-RULE_DIMENSION = {
-    "R-COMPL-001": "completeness",
-    "R-COMPL-002": "completeness",
-    "R-UNIQ-001":  "uniqueness",
-    "R-VALID-001": "validity",
-    "R-VALID-002": "validity",
-    "R-VOL-001":   "volume",
-}
-
-# Map check name → rule_id (since Soda's attributes may not pass through reliably)
-RULE_NAME_TO_ID = {
-    "Completeness – customer_id null percentage under 5%": "R-COMPL-001",
-    "Completeness – order_id never null":                  "R-COMPL-002",
-    "Uniqueness – order_id unique within window":          "R-UNIQ-001",
-    "Validity – email format compliance":                  "R-VALID-001",
-    "Validity – quantity must be positive integer":        "R-VALID-002",
-    "Volume – batch is non-empty":                         "R-VOL-001",
-}
+SUITE_PATH        = "/opt/jobs/dq/orders_suite.json"
 
 ORDER_SCHEMA = StructType([
     StructField("order_id",      StringType()),
@@ -78,197 +48,102 @@ ORDER_SCHEMA = StructType([
 
 EMAIL_RE = r"^[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}$"
 
+# Load GE suite once at module level
+with open(SUITE_PATH) as f:
+    SUITE_DICT = json.load(f)
+
 
 # ---------------------------------------------------------------------------
-# def to_obs_event(check: dict, batch_id: int, batch_size: int) -> dict:
-#     attrs  = (check.get("attributes") or {}) or {}
-#     status = "PASS" if check.get("outcome") == "pass" else "BREACH"
-#     sev    = attrs.get("severity", "warn").upper() if status == "BREACH" else "INFO"
-#     return {
-#         "event_id":     str(uuid.uuid4()),
-#         "pipeline_id":  "orders-ingestion-pipeline",
-#         "batch_id":     str(batch_id),
-#         "entity":       f"kafka.{SOURCE_TOPIC}",
-#         "metric":       check.get("name"),
-#         "dq_dimension": attrs.get("dimension"),
-#         "rule_id":      attrs.get("rule_id"),
-#         "value":        check.get("value"),
-#         "threshold":    check.get("threshold"),
-#         "status":       status,
-#         "severity":     sev,
-#         "timestamp":    datetime.now(timezone.utc).isoformat(),
-#         "metadata": {
-#             "batch_size":    batch_size,
-#             "check_outcome": check.get("outcome"),
-#         },
-#     }
-
-def resolve_rule_id(name: str) -> str:
-    name_lower = (name or "").lower()
-    if "customer_id null percentage" in name_lower: return "R-COMPL-001"
-    if "order_id never null"          in name_lower: return "R-COMPL-002"
-    if "order_id unique"              in name_lower: return "R-UNIQ-001"
-    if "email format"                 in name_lower: return "R-VALID-001"
-    if "quantity must be positive"    in name_lower: return "R-VALID-002"
-    if "batch is non-empty"           in name_lower: return "R-VOL-001"
-    return "UNKNOWN"
-
-def _extract_diag_value(diagnostics: dict):
-    if not isinstance(diagnostics, dict):
-        return None, None
-    val = diagnostics.get("value")
-    if not isinstance(val, (int, float)):
-        val = None
-
-    fail = diagnostics.get("fail") or {}
-    threshold = (fail.get("greaterThan")
-                 or fail.get("greaterThanOrEqual")
-                 or fail.get("lessThan")
-                 or fail.get("lessThanOrEqual"))
-    # 0.0 is falsy in Python's `or` — fix that
-    for key in ("greaterThan", "greaterThanOrEqual", "lessThan", "lessThanOrEqual"):
-        if key in fail:
-            threshold = fail[key]
-            break
-    if not isinstance(threshold, (int, float)):
-        threshold = None
-    return val, threshold
+def _extract_value(result_dict: dict):
+    """Pull a meaningful numeric value out of GE's result dict.
+    GE puts it in different keys depending on expectation type."""
+    for key in ("observed_value", "unexpected_percent",
+                "unexpected_count", "element_count"):
+        v = result_dict.get(key)
+        if isinstance(v, (int, float)):
+            return float(v)
+    return None
 
 
-def _resource_attrs(check: dict) -> dict:
-    """Soda exposes our YAML attributes here (not under 'attributes')."""
-    return {a["name"]: a["value"]
-            for a in (check.get("resourceAttributes") or [])
-            if isinstance(a, dict) and "name" in a}
+def _extract_threshold(expectation_kwargs: dict):
+    """Pull the threshold from the expectation's kwargs."""
+    if "mostly" in expectation_kwargs:
+        return float(expectation_kwargs["mostly"])
+    if "min_value" in expectation_kwargs:
+        return float(expectation_kwargs["min_value"])
+    if "max_value" in expectation_kwargs:
+        return float(expectation_kwargs["max_value"])
+    return 0.0
 
 
+def run_ge_validation(batch_df: DataFrame) -> list[dict]:
+    """Run GE 0.18 suite against the batch DataFrame. Return normalized check results."""
+    from great_expectations.dataset import SparkDFDataset
+
+    # GE 0.18 has a simple wrapper: SparkDFDataset wraps a Spark DataFrame
+    # and exposes all expectations as direct methods on it.
+    ds = SparkDFDataset(batch_df)
+
+    out = []
+    for exp in SUITE_DICT["expectations"]:
+        meta = exp.get("meta", {})
+        etype = exp["expectation_type"]
+        kwargs = exp["kwargs"]
+
+        # Call the expectation method dynamically
+        method = getattr(ds, etype, None)
+        if method is None:
+            print(f"[ge-skip] unknown expectation: {etype}")
+            continue
+
+        try:
+            result = method(**kwargs)
+            success = result.success
+            r = result.result or {}
+        except Exception as e:
+            print(f"[ge-skip] {etype} failed: {e}")
+            continue
+
+        out.append({
+            "name":      etype,
+            "rule_id":   meta.get("rule_id", "UNKNOWN"),
+            "dimension": meta.get("dimension", "unknown"),
+            "severity":  meta.get("severity", "warn"),
+            "outcome":   "pass" if success else "fail",
+            "value":     _extract_value(r),
+            "threshold": _extract_threshold(kwargs),
+        })
+    return out
+
+
+# ---------------------------------------------------------------------------
 def to_obs_event(check: dict, batch_id: int, batch_size: int) -> dict:
-    name = check.get("name", "")
-    attrs = _resource_attrs(check)
-
-    # Prefer Soda-provided attributes; fall back to substring match if missing
-    rule_id   = attrs.get("rule_id")   or resolve_rule_id(name)
-    dimension = attrs.get("dimension") or RULE_DIMENSION.get(rule_id, "unknown")
-    yaml_sev  = (attrs.get("severity") or "warn").upper()
-
-    status   = "PASS" if check.get("outcome") == "pass" else "BREACH"
-    severity = yaml_sev if status == "BREACH" else "INFO"
-
-    value, threshold = _extract_diag_value(check.get("diagnostics") or {})
+    status   = "PASS" if check["outcome"] == "pass" else "BREACH"
+    severity = check["severity"].upper() if status == "BREACH" else "INFO"
 
     return {
         "event_id":     str(uuid.uuid4()),
         "pipeline_id":  "orders-ingestion-pipeline",
         "batch_id":     str(batch_id),
         "entity":       f"kafka.{SOURCE_TOPIC}",
-        "metric":       name,
-        "dq_dimension": dimension,
-        "rule_id":      rule_id,
-        "value":        value,
-        "threshold":    threshold,
+        "metric":       check["name"],
+        "dq_dimension": check["dimension"],
+        "rule_id":      check["rule_id"],
+        "value":        check["value"],
+        "threshold":    check["threshold"],
         "status":       status,
         "severity":     severity,
         "timestamp":    datetime.now(timezone.utc).isoformat(),
         "metadata": {
             "batch_size":    batch_size,
-            "check_outcome": check.get("outcome"),
+            "check_outcome": check["outcome"],
         },
     }
-
-# def _safe_number(v):
-#     if v is None:
-#         return None
-#     if isinstance(v, (int, float)):
-#         return float(v)
-#     if isinstance(v, str):
-#         try:
-#             return float(v.rstrip("%").strip())
-#         except ValueError:
-#             return None
-#     return None
-
-# def to_obs_event(check: dict, batch_id: int, batch_size: int) -> dict:
-#     name = check.get("name", "")
-#     rule_id = resolve_rule_id(name)
-#     dimension = RULE_DIMENSION.get(rule_id, "unknown")
-
-#     status = "PASS" if check.get("outcome") == "pass" else "BREACH"
-#     severity = RULE_SEVERITY.get(rule_id, "WARN") if status == "BREACH" else "INFO"
-
-#     # Soda's metric value can live in different places across versions
-#     value = (_safe_number(check.get("value"))
-#              or _safe_number(check.get("metric_value")))
-
-#     # Last resort: try metrics[0]["value"] only if it's actually a dict
-#     if value is None:
-#         metrics = check.get("metrics") or []
-#         if metrics and isinstance(metrics[0], dict):
-#             value = _safe_number(metrics[0].get("value"))
-
-#     # Threshold: parse from check definition string if not directly provided
-#     threshold = _safe_number(check.get("threshold"))
-#     if threshold is None:
-#         # parse from check name like "missing_percent(customer_id) < 1"
-#         import re
-#         defn = check.get("definition", "") or check.get("expression", "")
-#         m = re.search(r"[<>=]+\s*([\d.]+)", defn)
-#         if m:
-#             threshold = float(m.group(1))
-
-#     return {
-#         "event_id":     str(uuid.uuid4()),
-#         "pipeline_id":  "orders-ingestion-pipeline",
-#         "batch_id":     str(batch_id),
-#         "entity":       f"kafka.{SOURCE_TOPIC}",
-#         "metric":       name,
-#         "dq_dimension": dimension,
-#         "rule_id":      rule_id,
-#         "value":        value,
-#         "threshold":    threshold,
-#         "status":       status,
-#         "severity":     severity,
-#         "timestamp":    datetime.now(timezone.utc).isoformat(),
-#         "metadata": {
-#             "batch_size":    batch_size,
-#             "check_outcome": check.get("outcome"),
-#         },
-#     }
-
-
-# def to_obs_event(check: dict, batch_id: int, batch_size: int) -> dict:
-#     name = check.get("name", "")
-#     # rule_id = RULE_NAME_TO_ID.get(name, "UNKNOWN")
-#     rule_id = resolve_rule_id(check.get("name"))
-#     dimension = RULE_DIMENSION.get(rule_id, "unknown")
-
-#     status = "PASS" if check.get("outcome") == "pass" else "BREACH"
-#     severity = RULE_SEVERITY.get(rule_id, "WARN") if status == "BREACH" else "INFO"
-
-#     return {
-#         "event_id":     str(uuid.uuid4()),
-#         "pipeline_id":  "orders-ingestion-pipeline",
-#         "batch_id":     str(batch_id),
-#         "entity":       f"kafka.{SOURCE_TOPIC}",
-#         "metric":       name,
-#         "dq_dimension": dimension,
-#         "rule_id":      rule_id,
-#         "value":        check.get("value"),
-#         "threshold":    check.get("threshold"),
-#         "status":       status,
-#         "severity":     severity,
-#         "timestamp":    datetime.now(timezone.utc).isoformat(),
-#         "metadata": {
-#             "batch_size":    batch_size,
-#             "check_outcome": check.get("outcome"),
-#         },
-#     }
 
 
 # ---------------------------------------------------------------------------
 def build_handler():
     def handler(batch_df: DataFrame, batch_id: int):
-        # CRITICAL FIX: use the session the DataFrame belongs to,
-        # not the outer `spark` variable.
         spark = batch_df.sparkSession
 
         batch_df = batch_df.persist()
@@ -305,59 +180,43 @@ def build_handler():
         n_clean      = clean_df.count()
         n_quarantine = quarantine_df.count()
 
-        # Write CLEAN records → orders_clean
         if n_clean > 0:
             (clean_df
                 .select(F.to_json(F.struct(*clean_df.columns)).alias("value"))
-                .write
-                .format("kafka")
+                .write.format("kafka")
                 .option("kafka.bootstrap.servers", KAFKA_BOOTSTRAP)
                 .option("topic", CLEAN_TOPIC)
                 .save())
 
-        # Write BAD records → orders_quarantine (with reason + batch id)
         if n_quarantine > 0:
             quar_payload = (quarantine_df
                             .withColumn("_batch_id", F.lit(batch_id))
                             .withColumn("_quarantined_at", F.current_timestamp().cast("string")))
             (quar_payload
                 .select(F.to_json(F.struct(*quar_payload.columns)).alias("value"))
-                .write
-                .format("kafka")
+                .write.format("kafka")
                 .option("kafka.bootstrap.servers", KAFKA_BOOTSTRAP)
                 .option("topic", QUARANTINE_TOPIC)
                 .save())
 
-        # --- 2. Batch-level DQ: Soda Core -----------------------------------
-        batch_df.createOrReplaceTempView("orders_batch")
+        # --- 2. Batch-level DQ: Great Expectations --------------------------
+        try:
+            checks = run_ge_validation(batch_df)
+        except Exception as e:
+            print(f"[ge-error] batch={batch_id} error={e}")
+            checks = []
 
-        from soda.scan import Scan
-        scan = Scan()
-        scan.set_scan_definition_name(f"orders_batch_{batch_id}")
-        scan.set_data_source_name("spark_df")
-        scan.add_spark_session(spark, data_source_name="spark_df")
-        scan.add_sodacl_yaml_file("/opt/jobs/dq/orders_checks.yml")
-        scan.execute()
-
-        results = scan.get_scan_results() or {}
-        checks  = results.get("checks", [])
-        # for c in checks:
-        #     print(f"[soda] {c.get('name'):<60} outcome={c.get('outcome')} "
-        #         f"value={c.get('value')} threshold={c.get('threshold')}")
-        # for c in checks:
-        #     print(f"[soda-name] {repr(c.get('name'))}")
         for c in checks:
-            print(f"[soda-full] === {c.get('name')} ===")
-            print(json.dumps(c, indent=2, default=str))
+            print(f"[ge] {c['rule_id']:<12} outcome={c['outcome']:<4} "
+                  f"value={c['value']} threshold={c['threshold']}")
 
-        events  = [to_obs_event(c, batch_id, size) for c in checks]
+        events = [to_obs_event(c, batch_id, size) for c in checks]
 
         if events:
             obs_df = spark.createDataFrame(
                 [(json.dumps(e),) for e in events], ["value"]
             )
-            (obs_df.write
-                .format("kafka")
+            (obs_df.write.format("kafka")
                 .option("kafka.bootstrap.servers", KAFKA_BOOTSTRAP)
                 .option("topic", OBS_TOPIC)
                 .save())
@@ -375,7 +234,7 @@ def build_handler():
 # ---------------------------------------------------------------------------
 def main():
     spark = (SparkSession.builder
-             .appName("dq_stream_job")
+             .appName("dq_stream_job_ge")
              .getOrCreate())
     spark.sparkContext.setLogLevel("WARN")
 
